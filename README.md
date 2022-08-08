@@ -3,6 +3,3 @@
 - 🌱 Obecnie rozwijam swoje umiejętności w HTML, CSS, PHP, JavaScript, JavaQuery, SQL, 
 - 💞️ Chciałbym rozwijać moją pasje i zacząć pracować zawodowo jako programista z doświadczonym zespołem,
 - 📫 Możesz skontaktować się zemną za pomocą adresu email damiankwoka152@gmail.com
-
-Twórca influence.promo
-Zarządca zbudowy.pl
