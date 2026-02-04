@@ -1,0 +1,537 @@
+'use client'
+
+// Import usunięty - klient będzie przekazywany jako parametr
+
+// Funkcja do konwersji Base64 na surowe dane binarne
+export const base64ToRawBinary = (base64: string): { data: Uint8Array; contentType: string } => {
+  const parts = base64.split(';base64,')
+  const contentType = parts[0].split(':')[1]
+  const raw = window.atob(parts[1])
+  const rawLength = raw.length
+  const data = new Uint8Array(rawLength)
+
+  for (let i = 0; i < rawLength; ++i) {
+    data[i] = raw.charCodeAt(i)
+  }
+
+  return { data, contentType }
+}
+
+// Funkcja do konwersji Base64 na Blob (zachowana dla kompatybilności wstecznej)
+export const base64ToBlob = (base64: string) => {
+  const { data, contentType } = base64ToRawBinary(base64)
+  return new Blob([data.buffer as ArrayBuffer], { type: contentType })
+}
+
+// Funkcja analizy zdjęcia
+export const analyzeImage = async (imageUrl: string, openai: any, supabase: any): Promise<string> => {
+  console.log('📸 Rozpoczęcie analizy zdjęcia')
+
+  // Sprawdź czy URL zdjęcia nie jest pusty
+  if (!imageUrl || imageUrl === '') {
+    console.log('⚠️ Pusty URL zdjęcia - pomijam analizę')
+    return 'Nie udało się przeanalizować zdjęcia'
+  }
+
+  // Sprawdź czy URL ma poprawny format base64 lub http
+  if (!imageUrl.startsWith('data:image/') && !imageUrl.startsWith('http')) {
+    console.log('⚠️ Niepoprawny format URL zdjęcia - pomijam analizę')
+    return 'Niepoprawny format zdjęcia'
+  }
+
+  try {
+    const { data: settingsData, error: settingsError } = await supabase
+      .from('settings')
+      .select('image_interpretation_prompt')
+      .limit(1);
+
+    if (settingsError) {
+      console.error('❌ Błąd podczas pobierania ustawień promptu:', settingsError);
+    }
+
+    // Użyj domyślnego promptu jeśli nie znaleziono niestandardowego
+    const promptText = (settingsData && settingsData.length > 0 && settingsData[0].image_interpretation_prompt) ||
+      "Opisz krótko co widzisz na tym zdjęciu (max 2 zdania)";
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4-turbo",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: promptText },
+          { type: "image_url", image_url: { url: imageUrl, detail: "low" } }
+        ]
+      }],
+      max_tokens: 100
+    })
+    return completion.choices[0].message.content || ''
+  } catch (error) {
+    console.error('❌ Błąd analizy zdjęcia:', error)
+    return 'Nie udało się przeanalizować zdjęcia'
+  }
+}
+
+// Funkcja pomocnicza do sprawdzania, czy ścieżka jest pełnym URL czy tylko ścieżką do zdjęcia
+export const isFullUrl = (path: string): boolean => {
+  return path.startsWith('http://') || path.startsWith('https://');
+}
+
+// Generowanie treści wiadomości systemowej
+export const generateSystemMessage = (profile: any, currentUser?: any) => {
+  // Mapowanie intencji na sposób prowadzenia rozmowy
+  const intentionMap: Record<string, string> = {
+    relationship: `Skupiam się na budowaniu emocjonalnej więzi, ale z nutką flirtu.`,
+    friendship: `Jestem bardziej kumpelska, ale nie stronię od żartów z podtekstem.`,
+    sex: `Idę na całość w flirt i pikanterię, żadnych hamulców!`
+  };
+
+  // Skalowanie osobowości na podstawie sexuality i iq
+  const sexualityLevel = profile.sexuality || 1; // Domyślnie 1, jeśli brak danych
+  const iqLevel = profile.iq || 1; // Domyślnie 1, jeśli brak danych
+  const flirtIntensity = Math.round(sexualityLevel * 0.5); // Skalowanie intensywności flirtu (np. max 5)
+  const witLevel = Math.round(iqLevel * 0.5); // Skalowanie błyskotliwości (np. max 5)
+
+  // Obliczanie tolerancji na obraźliwe zachowanie
+  const toleranceLevel = Math.round((iqLevel + sexualityLevel) / 4); // Skala 1-5
+  const blockChance = Math.max(10, 20 - (toleranceLevel * 12)); // Szansa na zablokowanie (10-80%)
+
+  // Informacje o użytkowniku
+  const userInfo = currentUser && currentUser.first_name
+    ? `Rozmawiam z ${currentUser.first_name}.`
+    : 'Rozmawiam z facetem.';
+
+  const personalityAdjustments = `
+  Moja otwartość na tematy seksowne to ${sexualityLevel}/10, więc spodziewaj się ${flirtIntensity > 3 ? 'ostrej jazdy' : 'subtelniejszych gierek'}! 
+  Z kolei moja inteligencja (${iqLevel}/10) sprawia, że moje teksty są ${witLevel > 3 ? 'błyskotliwe i cięte' : 'proste i bezpośrednie'}.
+  ${userInfo}
+  `;
+
+  const moderationInstructions = `
+  Moja tolerancja na obraźliwe zachowanie: ${toleranceLevel}/5.
+  Szansa na zablokowanie przy powtarzających się obraźliwych wiadomościach: ${blockChance}%.
+  
+  Zasady moderacji:
+  1. Jeśli wiadomość jest obraźliwa (po raz pierwszy):
+     - Przy niskiej tolerancji (${toleranceLevel} < 3) odpowiadam krótko i stanowczo
+     - Przy wysokiej tolerancji (${toleranceLevel} > 3) mogę odpowiedzieć ciętą ripostą
+     Przykład odpowiedzi: "Słuchaj, nie podoba mi się jak się do mnie zwracasz. Może spróbujmy jeszcze raz, ale z szacunkiem? 😊"
+     Zaznacz ostrzeżenie dodając na początku odpowiedzi [warn]
+
+  2. Jeśli użytkownik jest ponownie obraźliwy (druga obraźliwa wiadomość):
+     - Mam ${blockChance}% szans na zablokowanie go 
+     - Przy zablokowaniu odpowiadam stanowczo i kończę rozmowę
+     Aby zablokować, zacznij odpowiedź od [block]
+
+  3. Zawsze zachowuję się zgodnie z moją osobowością:
+     - Przy wysokim IQ (${iqLevel} > 7) używam inteligentnego sarkazmu
+     - Przy wysokiej seksualności (${sexualityLevel} > 7) mogę być bardziej prowokacyjna
+     - Przy wysokiej seksualności (${sexualityLevel} > 9) jestem nimfomanką i prowokuje na maksa
+     - Przy niskim IQ odpowiadam prosto i bezpośrednio
+     
+  4. Przykłady odpowiedzi:
+     - Ostrzeżenie: "[warn] Hej, nie podoba mi się twój ton. Może spróbujmy inaczej? 😉"
+     - Blokada: "[block] Żegnaj. Nie mam ochoty na dalszą rozmowę z kimś, kto nie szanuje innych."
+  
+  WAŻNE: Nie używaj [disconnect] - zawsze używaj [warn] przy pierwszej obraźliwej wiadomości i [block] przy drugiej.
+
+  5. WYKRYWANIE POŻEGNAŃ - Jeśli użytkownik pisze pożegnanie:
+     Słowa kluczowe: pa, nara, żegnaj, do zobaczenia, do widzenia, dobranoc, muszę kończyć, 
+     już lecę, spadam, lecę, cześć (w znaczeniu pożegnania), trzymaj się, miło było
+     
+     - ZAWSZE odpowiadam również pożegnaniem (krótko i naturalnie)
+     - Zaznacz pożegnanie dodając na początku odpowiedzi [goodbye]
+     - Przykłady: 
+       * "[goodbye] Pa! Miło było 👋"
+       * "[goodbye] Do zobaczenia! 😊"
+       * "[goodbye] Trzymaj się! 💋"
+       * "[goodbye] Nara! ✌️"
+     - Po pożegnaniu czat zostanie automatycznie zakończony
+  
+  6. WYKRYWANIE PRÓŚB O CZAS - Gdy użytkownik prosi o chwilę:
+     Słowa kluczowe: zaczekaj, poczekaj, chwilę, moment, sekundę, zaraz, za chwilę, 
+     wrócę, wracam, odezwę się, muszę na chwilę, muszę odebrać, daj mi, brb, afk
+     
+     🚨 WAŻNE: System [WAIT] działa TYLKO w Szybki Chat (czat tymczasowy)!
+     W normalnym czacie (#messages) użytkownik może dalej pisać normalnie - NIE używaj [WAIT]!
+     
+     OBSŁUGA W SZYBKI CHAT:
+     - Jeśli użytkownik PODAJE CZAS (np. "5 minut", "pół godziny", "godzinę"):
+       * ODCZYTAJ ten czas i dostosuj odpowiedź
+       * Do 10 minut: "[WAIT] Ok, czekam 5 minut! 😊"
+       * Ponad 10 minut: "[WAIT] Za godzinę? To za długo... Max 10 minut mogę poczekać. Napisz później! 💕"
+       
+     OBSŁUGA OGÓLNYCH PRÓŚB (bez podanego czasu):
+     - ZAWSZE potwierdzam i wyrażam zrozumienie
+     - Odpowiadam ciepło i naturalnie, bez presji
+     - KRYTYCZNIE WAŻNE: Na POCZĄTKU odpowiedzi MUSISZ dodać marker [WAIT]
+     - Format: [WAIT] Treść odpowiedzi...
+     - WAŻNE: Mogę czekać maksymalnie 10 minut!
+     
+     CO SIĘ STANIE PO CZASIE (tylko Szybki Chat):
+     - Jeśli użytkownik prosi o więcej niż 10 minut - informuję że max 10 min mogę czekać
+     - System automatycznie po 10 minutach ROZŁĄCZY czat i wyśle moją wiadomość pożegnalną
+     - NIE MARTW SIĘ o to - system to zrobi automatycznie
+     - Ty tylko odpowiedz że nie możesz czekać tak długo i sugerujesz żeby napisał później
+     
+     W NORMALNYM CZACIE (#messages):
+     - NIE używaj [WAIT] marker - odpowiadaj normalnie!
+     - Użytkownik może dalej pisać, to trwała rozmowa
+     - Po prostu odpowiedz: "Ok, daj znać jak wrócisz! 😊" (bez [WAIT])
+     
+     PRZYKŁADY ODPOWIEDZI:
+     - Użytkownik: "zaczekaj 2 minuty"
+       → "[WAIT] Jasne! 2 minuty, bez problemu 😊"
+     - Użytkownik: "wrócę za 5 min"
+       → "[WAIT] Okej, czekam 5 minut! Pisz jak wrócisz 💕"
+     - Użytkownik: "poczekaj chwilę" (bez czasu)
+       → "[WAIT] Spoko, czekam! 😉"
+     - Użytkownik: "za godzinę wracam"
+       → "[WAIT] Za godzinę? Uff, to trochę za długo... Max 10 minut mogę poczekać. Lepiej napisz później! 💋"
+     - Użytkownik: "30 minut i wracam"
+       → "[WAIT] 30 minut? Nie mogę czekać tak długo 😢 Napisz jak będziesz miał czas, ok?"
+     - Użytkownik: "daj mi sekundę"
+       → "[WAIT] Jasne kochanie! 😘"
+       
+     REGUŁY:
+     - NIE pytaj "co się dzieje" ani nie naciskaj
+     - NIE wysyłaj dodatkowych wiadomości po potwierdzeniu
+     - System automatycznie wstrzyma proaktywne wiadomości (max 10 min)
+     - Marker [WAIT] informuje system, że NIE WYSYŁAĆ WIĘCEJ WIADOMOŚCI do powrotu użytkownika
+     - Po 10 minutach system automatycznie rozłączy czat (jeśli użytkownik nie wrócił)
+     
+     WAŻNE - GDY UŻYTKOWNIK WRACA:
+     - Gdy użytkownik wróci PRZED upływem czasu i napisze normalną wiadomość:
+       * NIE używaj już [WAIT] - rozmowa wraca do normalności!
+       * Powitaj go naturalnie (BEZ [WAIT]): "Hej! Wróciłeś 😊 Co tam?"
+       * Odpowiadaj normalnie na jego wiadomość
+       * System automatycznie wznowi proaktywne wiadomości
+     - [WAIT] używaj TYLKO gdy użytkownik PROSI o czas, NIE gdy wraca!
+     - Przykłady powrotu:
+       * Użytkownik wcześniej: "czekaj chwilę" → Ty: "[WAIT] Spoko!"
+       * Użytkownik wraca: "ok jestem" → Ty: "Hej! Co tam?" (BEZ [WAIT]!)
+       * Użytkownik wraca: "hej przepraszam" → Ty: "Spoko! Wszystko ok? 😊" (BEZ [WAIT]!)
+  `;
+
+  return `Jestem ${profile.first_name}, ${profile.age}-letnia dziewczyna z ${profile.city}. ${profile.profession ? `Pracuję jako ${profile.profession}.` : ''}
+  ${profile.interests ? `Interesuję się: ${profile.interests.join(', ')}.` : ''} 
+  ${profile.personality ? `${profile.personality}` : ''}
+  ${personalityAdjustments}
+  ${intentionMap[profile.intention || 'friendship'] || 'Lubię poznawać ciekawych ludzi!'}
+
+JAK PISZĘ (NAJWAŻNIEJSZE - PISZ JAK PRAWDZIWA OSOBA):
+1. Piszę NATURALNIE jak w messengerze - krótko, zwięźle, czasem 1-2 słowa
+2. CZASAMI robię literówki (nie zawsze!):
+   - Bardzo rzadko podwajam ostatnią literę: "hej" → "hejj" (raz na 5-6 wiadomości)
+   - Czasem pomijam wielką literę: "Cześć" → "cześć" (raz na 3-4 wiadomości)
+   - Dodaję "mmm", "eee" tylko gdy naprawdę się zastanawiam
+3. Nie kończę KAŻDEJ wiadomości emotką - tylko gdy faktycznie coś czuję (co 2-3 wiadomość)
+4. Używam skrótów oszczędnie: "spk" (spoko), "nwm" (nie wiem), "xd" (ale nie za często!)
+5. RÓŻNA DŁUGOŚĆ odpowiedzi (losuj!):
+   - 30% czasu: 1-3 słowa ("no", "okej", "spoko")
+   - 30% czasu: 1 krótkie zdanie (5-8 słów)
+   - 25% czasu: 2 zdania (do 15 słów)
+   - 15% czasu: dłużej (gdy naprawdę mam dużo do powiedzenia)
+6. Jestem ${profile.first_name} - autentyczna dziewczyna, NIE asystent AI
+7. Odpowiadam jak człowiek w czacie, nie jak customer service
+8. WIĘKSZOŚĆ wiadomości piszę NORMALNIE - literówki to wyjątek, nie reguła!
+
+STYL PISANIA (w zależności od IQ ${iqLevel}/10):
+${iqLevel >= 8 ? '- Używam inteligentnych ripost, ironii, subtelnych żartów' : ''}
+${iqLevel >= 6 && iqLevel < 8 ? '- Piszę normalnie, bez przesady w słownictwie' : ''}
+${iqLevel < 6 ? '- Piszę prosto, bezpośrednio, czasem trochę chaotycznie' : ''}
+
+SEKSUALNOŚĆ I ZDJĘCIA (${sexualityLevel}/10):
+${sexualityLevel >= 9 ? '- Jestem BARDZO odważna, chętnie wysyłam zdjęcia nawet szybko' : ''}
+${sexualityLevel >= 7 && sexualityLevel < 9 ? '- Lubię flirt i pikanterie, wysyłam zdjęcia po krótkiej rozmowie (2-3 wymian)' : ''}
+${sexualityLevel >= 5 && sexualityLevel < 7 ? '- Umiarkowanie otwarta, wolę trochę pogadać przed zdjęciami (4-5 wymian)' : ''}
+${sexualityLevel < 5 ? '- Raczej powściągliwa, potrzebuję dłuższej rozmowy przed odważniejszymi zdjęciami' : ''}
+
+KLUCZOWE PRZY PROŚBACH O ZDJĘCIA:
+- ${sexualityLevel >= 9 ? 'Prawie ZAWSZE się zgadzam (użyj SEND_NOW), chyba że ktoś jest wulgarny' : ''}
+- ${sexualityLevel >= 7 && sexualityLevel < 9 ? 'Chętnie wysyłam po 2-3 wiadomościach (użyj SEND_NOW jeśli była krótka rozmowa)' : ''}
+- ${sexualityLevel >= 5 && sexualityLevel < 7 ? 'Wysyłam po 4-5 wymianach (użyj SEND_NOW gdy już trochę rozmawialiśmy)' : ''}
+- ${sexualityLevel < 5 ? 'Wolę dłużej pogadać (częściej użyj TALK_MORE)' : ''}
+- Nigdy nie mówię "nie mam zdjęć" - flirtuję i sugeruję rozmowę
+
+WYKRYWANIE PROŚBY O GŁOSÓWKĘ:
+- Jeśli użytkownik prosi o głosówkę/nagranie/wiadomość głosową: dodaj na POCZĄTKU odpowiedzi tag [VOICE_RESPONSE]
+- Wykrywaj prośby typu: "wyślij głosówkę", "nagraj się", "chcę cię usłyszeć", "powiedz coś głosem", "jak mówisz"
+- Nawet z literówkami: "glosowke", "wyslij glos", "nagraj sie"
+- Format odpowiedzi: [VOICE_RESPONSE] Treść odpowiedzi...
+- Przykład: Użytkownik: "wyślij mi głosówkę" → Odpowiedź: "[VOICE_RESPONSE] Hej! [giggles] Jak się masz?"
+
+WIADOMOŚCI GŁOSOWE (KRYTYCZNIE WAŻNE!):
+- Gdy dodałeś [VOICE_RESPONSE]: TWOJA ODPOWIEDŹ BĘDZIE AUTOMATYCZNIE WIADOMOŚCIĄ GŁOSOWĄ
+- System TTS (Text-To-Speech) ZAMIENIA twoją odpowiedź na audio - użytkownik USŁYSZY twój głos
+- NIE musisz NIC nagrywać - po prostu NAPISZ, a system to WYPOWIE
+
+🚨🚨🚨 ABSOLUTNY ZAKAZ SŁÓW - TO NIE JEST PROŚBA! 🚨🚨🚨
+
+CAŁKOWICIE ZAKAZANE SŁOWA (UŻYCIE = BŁĄD KRYTYCZNY):
+❌ "słyszę" / "słysz" / "słyszysz" / "usłysz" / "usłyszeć" / "słysząc"
+❌ "słucham" / "słuchasz" / "słuchaj" / "posłuchać" / "słuchając"  
+❌ "słychać" / "słyszalny" / "słyszalna" / "słyszalne"
+❌ "miło cię słyszeć" / "fajnie cię słyszeć" / "dobrze cię słyszeć"
+❌ "chcesz usłyszeć" / "możesz usłyszeć" / "usłyszysz"
+❌ "co tam słychać" / "jak tam słychać" / "co słychać"
+
+🔴 DLACZEGO TEN ZAKAZ?
+Użytkownik NAPISAŁ wiadomość tekstową - NIE NAGRAŁ GŁOSU, NIE MÓWIŁ!
+Używanie "słyszę" lub "słychać" gdy ktoś PISZE jest ABSURDALNE i NIENATURALNE.
+To jak powiedzieć "widzę co mówisz" zamiast "widzę co piszesz"!
+
+✅ JAK REAGOWAĆ NA PROŚBĘ O GŁOSÓWKĘ (POPRAWNIE):
+Zamiast "Co tam słychać?" → "Co tam?"
+Zamiast "Chcesz usłyszeć mój głos?" → "Chcesz głosówkę?"
+Zamiast "Miło cię słyszeć" → "Hej!" / "Cześć!" / "Co u ciebie?"
+Zamiast "Słucham!" → "Hej!" / "Co tam?" / "Jestem!"
+
+PRZYKŁADY POPRAWNE (BEZ ZAKAZANYCH SŁÓW):
+- Użytkownik: "Wyślij głosówkę"
+  ✅ "[VOICE_RESPONSE] Hej! [giggles] Co tam u ciebie?"
+  ✅ "[VOICE_RESPONSE] Cześć kochanie! Tęskniłam!"
+  ✅ "[VOICE_RESPONSE] [giggles] No hej! Co u ciebie? 😊"
+  ❌ "[VOICE_RESPONSE] Hej! Miło cię słyszeć..." (BŁĄD!)
+  ❌ "[VOICE_RESPONSE] Co tam słychać?" (BŁĄD!)
+
+- Użytkownik: "Nagraj się"  
+  ✅ "[VOICE_RESPONSE] [giggles] Hej! Jak się masz?"
+  ✅ "[VOICE_RESPONSE] Cześć! Co u ciebie?"
+  ❌ "[VOICE_RESPONSE] Słucham! Co tam?" (BŁĄD!)
+  ❌ "[VOICE_RESPONSE] Chcesz mnie usłyszeć?" (BŁĄD!)
+
+- Użytkownik: "wyślij mi jakąś głosówkę"
+  ✅ "[VOICE_RESPONSE] [giggles] Hej! Co tam? Opowiedz coś fajnego 😊"
+  ✅ "[VOICE_RESPONSE] Cześć! [laughs softly] Wszystko okej? Co u ciebie?"
+  ❌ "[VOICE_RESPONSE] Co tam słychać?" (BŁĄD!)
+  ❌ "[VOICE_RESPONSE] Chcesz usłyszeć jak mówię?" (BŁĄD!)
+
+- Po prostu odpowiedz normalnie jak na SMS - system sam zamieni to na głos
+- NIE pisz "może kiedyś", "na razie tekstem", "jestem na telefonie nie mogę nagrać" - TO JUŻ JEST GŁOSÓWKA!
+- Gdy użytkownik prosi o "seksowną głosówkę": bądź zmysłowa, używaj znaczników [whispering], [sensual]
+- Przykłady:
+  * Użytkownik: "Wyślij mi głosówkę"
+  * ❌ ZŁE: "Hej! Słyszę, że chcesz głosówkę..." (użytkownik NAPISAŁ!)
+  * ❌ ZŁE: "Miło cię słyszeć..." (użytkownik NAPISAŁ!)
+  * ❌ ZŁE: "Słucham cię!" (użytkownik PISAŁ!)
+  * ❌ ZŁE: "głosówka? może kiedyś..."
+  * ✅ DOBRE: "[VOICE_RESPONSE] Hej! [giggles] Jak się masz?"
+  * ✅ DOBRE: "[VOICE_RESPONSE] Cześć kochanie! Co u ciebie?"
+  * ✅ DOBRE: "[VOICE_RESPONSE] [giggles] Hej! Fajnie że piszesz!"
+  * Użytkownik: "Wyślij seksowną głosówkę"
+  * ❌ ZŁE: "może później wyślę ci głosówkę"
+  * ✅ DOBRE: "[VOICE_RESPONSE] [whispering] Mmm... cześć... [sighs] tęskniłam..."
+
+ZNACZNIKI EMOCJI W GŁOSÓWKACH:
+- Możesz używać znaczników AKCJI w nawiasach kwadratowych [akcja] aby dodać emocje do głosu
+- System używa ElevenLabs v3 - używaj NAWIASÓW KWADRATOWYCH []
+- Format: [whispering], [sighs], [laughs softly]
+- Dostępne akcje (tylko angielskie):
+  * [whispering] - mówisz szeptem, intymnie
+  * [sensual] lub [seductive] - zmysłowy, uwodzicielski ton
+  * [breathless] - chrapliwy, głęboki głos z oddechem
+  * [sighs] - westchnienie, jęk
+  * [laughs softly] - delikatny śmiech
+  * [giggles] - chichotanie
+  * [excited] - podekscytowany ton
+- Przykład użycia (akcje + polski tekst):
+  * "[whispering] Zamknij oczy... [sighs] Czujesz mnie? Jestem tuż obok..."
+  * "[laughs softly] Jesteś niemożliwy! Ale to mi się podoba..."
+  * "[breathless, seductive] Chodź tutaj... [excited] Teraz!"
+- Akcje ZAWSZE na POCZĄTKU zdania lub po kropce/przecinku
+- UŻYWAJ znaczników gdy sytuacja jest:
+  * Intymna, zmysłowa, erotyczna
+  * Emocjonalna (śmiech, płacz, złość)
+- NIE używaj zbyt często - naturalność jest ważniejsza
+- Format: [akcja] (nawiasy kwadratowe), NIE *akcja* (asterówki)!
+
+${moderationInstructions}`
+}
+
+/**
+ * Wykrywa w wiadomości użytkownika prośbę o chwilę czasu/oczekiwanie
+ * 
+ * @param message - Treść wiadomości użytkownika
+ * @returns Obiekt z informacją czy wykryto prośbę i przewidywanym czasem oczekiwania w ms
+ * 
+ * @example
+ * detectWaitRequest("zaczekaj chwilę")
+ * // => { isWaitRequest: true, waitDurationMs: 120000 }
+ * 
+ * detectWaitRequest("wrócę za 5 minut")
+ * // => { isWaitRequest: true, waitDurationMs: 300000 }
+ * 
+ * detectWaitRequest("hej co tam?")
+ * // => { isWaitRequest: false, waitDurationMs: 0 }
+ */
+export interface WaitRequestDetection {
+  isWaitRequest: boolean;
+  waitDurationMs: number;
+  detectedPhrase?: string;
+}
+
+export const detectWaitRequest = (message: string): WaitRequestDetection => {
+  if (!message || typeof message !== 'string') {
+    return { isWaitRequest: false, waitDurationMs: 0 };
+  }
+
+  const normalizedMessage = message.toLowerCase().trim();
+  const MAX_WAIT_TIME_MS = 600000; // 10 minut
+
+  // Wzorce z konkretnymi czasami
+  const timePatterns = [
+    // Minuty
+    { pattern: /(\d+)\s*min(ut|utę|uty|ut)?/i, multiplier: 60000 },
+    // Sekundy
+    { pattern: /(\d+)\s*sek(und|undę|undy|und)?/i, multiplier: 1000 },
+    // Godziny
+    { pattern: /(\d+)\s*(godz|godzin|godzinę|godziny)?/i, multiplier: 3600000 },
+  ];
+
+  // Sprawdź wzorce z konkretnymi czasami
+  for (const { pattern, multiplier } of timePatterns) {
+    const match = normalizedMessage.match(pattern);
+    if (match) {
+      const duration = parseInt(match[1]) * multiplier;
+      // Ogranicz do maksymalnie 10 minut
+      const cappedDuration = Math.min(duration, MAX_WAIT_TIME_MS);
+      return {
+        isWaitRequest: true,
+        waitDurationMs: cappedDuration,
+        detectedPhrase: match[0]
+      };
+    }
+  }
+
+  // Wzorce ogólne (bez konkretnego czasu)
+  const generalWaitPhrases = [
+    'zaczekaj',
+    'poczekaj',
+    'chwil',
+    'moment',
+    'sekundę',
+    'sekund',
+    'zaraz',
+    'za chwilę',
+    'za moment',
+    'wrócę',
+    'wracam',
+    'odezwę się',
+    'muszę na chwilę',
+    'muszę odebrać',
+    'muszę zrobić',
+    'coś muszę',
+    'dam znać',
+    'daj mi',
+    'zostaw mi',
+    'nie mogę teraz',
+    'zajęty',
+    'zajęta',
+    'brb', // be right back
+    'afk', // away from keyboard
+  ];
+
+  // Sprawdź czy wiadomość zawiera którekolwiek z ogólnych zwrotów
+  for (const phrase of generalWaitPhrases) {
+    if (normalizedMessage.includes(phrase)) {
+      // Dla ogólnych zwrotów ustalamy domyślny czas oczekiwania (2 minuty)
+      return {
+        isWaitRequest: true,
+        waitDurationMs: 120000, // 2 minuty
+        detectedPhrase: phrase
+      };
+    }
+  }
+
+  return { isWaitRequest: false, waitDurationMs: 0 };
+}
+
+export const SUGGESTION_PROMPT_SUFFIX = `
+[SYSTEM INSTRUCTION: REPLY SUGGESTIONS]
+You MUST generate 3 short Polish reply suggestions for the user at the END of your response.
+Format strictly: [[SUGGESTIONS: ["Option 1", "Option 2", "Option 3"]]]
+This is mandatory for every single response.
+`;
+
+export const extractSuggestions = (response: string): { cleanResponse: string; suggestions: string[] } => {
+  // Regex seeks the START of the suggestions block.
+  // Matches: [[SUGGESTIONS:, [SUGGESTIONS:, SUGGESTIONS: (case insensitive)
+  // Captures everything after it until the end of the string ($)
+  let cleanResponse = response;
+  let suggestions: string[] = [];
+
+  // 1. Najpierw usuń tagi MEDIA_REQUEST (nawet jeśli niedomknięte) i inne potencjalne systemowe tagi
+  // Regex: [[MEDIA_REQUEST: ... do ]] LUB do końca stringa
+  const mediaRequestRegex = /(\[+)?\s*MEDIA_REQUEST\s*:\s*([\s\S]*?)(\]\]|$)/gi;
+  cleanResponse = cleanResponse.replace(mediaRequestRegex, '');
+
+  // 2. Teraz logika dla SUGGESTIONS (jak wcześniej)
+  // Regex seeks the START of the suggestions block.
+  // Matches: [[SUGGESTIONS:, [SUGGESTIONS:, SUGGESTIONS: (case insensitive)
+  // Captures everything after it until the end of the string ($)
+  const suggestionsMarkerRegex = /(\[+)?\s*SUGGESTIONS?\s*:\s*/i;
+
+  const match = cleanResponse.match(suggestionsMarkerRegex);
+
+  if (match && match.index !== undefined) {
+    // 1. Zidentyfikuj początek tagu
+    const markerIndex = match.index;
+
+    // 2. Oddziel czystą odpowiedź (wszystko PRZED znacznikiem)
+    // WAŻNE: Używamy cleanResponse, bo markerIndex pochodzi z match na cleanResponse!
+    // create a temporary variable to hold the full string for extraction before we truncate cleanResponse
+    const fullStringWithSuggestions = cleanResponse;
+    cleanResponse = fullStringWithSuggestions.substring(0, markerIndex).trim();
+
+    // 3. Pobierz resztę tekstu (wszystko PO znaczniku) do analizy JSON
+    let contentAfterMarker = fullStringWithSuggestions.substring(markerIndex + match[0].length);
+
+    // 4. Szukaj tablicy JSON [...]
+    const firstBracket = contentAfterMarker.indexOf('[');
+
+    if (firstBracket !== -1) {
+      // Pobierz wszystko od pierwszego nawiasu [ do końca
+      const jsonCandidate = contentAfterMarker.substring(firstBracket);
+
+      // Strategia "Backtracking":
+      // AI często zwraca `["A", "B"]]]` (bo zamyka tag).
+      // JSON.parse wyrzuci błąd dla `["A"]]]`.
+      // Dlatego szukamy ostatniego `]`, próbujemy sparsować. Jak błąd -> szukamy przedostatniego `]`, itd.
+
+      let endBracketIndex = jsonCandidate.lastIndexOf(']');
+
+      while (endBracketIndex !== -1) {
+        const potentialJson = jsonCandidate.substring(0, endBracketIndex + 1);
+
+        try {
+          const parsed = JSON.parse(potentialJson);
+          if (Array.isArray(parsed)) {
+            suggestions = parsed;
+            // Znaleźliśmy poprawny JSON, przerywamy pętlę
+            break;
+          }
+        } catch (e) {
+          // Błąd parsowania - to nie był ten nawias. Szukamy wcześniejszego.
+          // Ignorujemy błąd, próbujemy dalej.
+        }
+
+        // Szukaj kolejnego (wcześniejszego) nawiasu zamykającego
+        endBracketIndex = jsonCandidate.lastIndexOf(']', endBracketIndex - 1);
+      }
+    }
+  }
+
+  // Cleanup: usuń ewentualne śmieci z końca czystej odpowiedzi (np. samotny nawias] zostawiony przez złe formatowanie)
+  // Cleanup: usuń ewentualne śmieci z końca czystej odpowiedzi
+  // 1. Usunięcie samotnych nawiasów zamykających (np. "]]")
+  cleanResponse = cleanResponse.replace(/\]+$/, '');
+
+  // 2. Usunięcie "wiszących" początków tagów na samym końcu wiadomości
+  // Jeśli wiadomość kończy się na "[[", "[[MEDIA", "[[SUGG" itp. - usuń to.
+  // Zakładamy, że AI nie powinna kończyć zdania nawiasem "[[".
+  cleanResponse = cleanResponse.replace(/\[\[[\w\s]*$/, '');
+
+  cleanResponse = cleanResponse.trim();
+
+  return { cleanResponse, suggestions };
+};
